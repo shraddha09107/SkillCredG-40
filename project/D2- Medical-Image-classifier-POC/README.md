@@ -1,4 +1,4 @@
-# AI-Powered Pneumonia Detection from Chest X-rays
+# AI-Powered Pneumonia Detection from Chest X-rays named-- DiagnoSight
 
 ## Overview
 
