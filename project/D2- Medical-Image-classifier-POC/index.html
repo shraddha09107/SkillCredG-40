@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>DiagnoSight - Medical Image Classifier</title>
+  <style>
+    /* 🌈 Light theme (default) */
+    body {
+      font-family: 'Segoe UI', Tahoma, sans-serif;
+      margin: 0;
+      padding: 0;
+      background: linear-gradient(135deg, #6a11cb, #2575fc);
+      color: #222;
+      transition: all 0.4s ease;
+    }
+    body.dark {
+      background: linear-gradient(135deg, #0f2027, #203a43, #2c5364);
+      color: #f1f1f1;
+    }
+    header {
+      text-align: center;
+      padding: 2rem;
+      color: white;
+    }
+    header h1 {
+      font-size: 2.5rem;
+      margin-bottom: 0.5rem;
+    }
+    header p {
+      font-size: 1.1rem;
+      opacity: 0.9;
+    }
+    main {
+      max-width: 950px;
+      margin: 2rem auto;
+      background: rgba(255,255,255,0.9);
+      color: #222;
+      padding: 2rem;
+      border-radius: 16px;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.15);
+      transition: all 0.4s ease;
+    }
+    body.dark main {
+      background: rgba(30,30,30,0.9);
+      color: #f1f1f1;
+    }
+    .upload-section {
+      text-align: center;
+      margin-bottom: 2rem;
+    }
+    input[type="file"] {
+      margin: 1rem 0;
+    }
+    button {
+      background: #2575fc;
+      color: white;
+      padding: 0.7rem 1.5rem;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 1rem;
+      transition: background 0.3s ease;
+    }
+    button:hover {
+      background: #6a11cb;
+    }
+    .toggle-btn {
+      background: #ff9800;
+      float: right;
+    }
+    .preview, .results {
+      margin-top: 2rem;
+      text-align: center;
+    }
+    .preview img, .gradcam img {
+      max-width: 400px;
+      border-radius: 12px;
+      margin-top: 1rem;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+    }
+    .card {
+      margin: 1rem auto;
+      padding: 1.5rem;
+      border-radius: 12px;
+      background: rgba(245,245,245,0.9);
+      box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+      transition: all 0.4s ease;
+    }
+    body.dark .card {
+      background: rgba(45,45,45,0.9);
+      color: #eee;
+    }
+    pre {
+      background: #272822;
+      color: #f8f8f2;
+      padding: 1rem;
+      border-radius: 8px;
+      overflow-x: auto;
+      text-align: left;
+    }
+    .instructions {
+      text-align: left;
+      margin-top: 2rem;
+      font-size: 0.95rem;
+    }
+    .instructions h3 {
+      margin-bottom: 0.5rem;
+    }
+    .instructions ul {
+      line-height: 1.6;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>🩺 DiagnoSight</h1>
+    <p>AI-powered Medical Image Classifier with Grad-CAM Explanations</p>
+    <button class="toggle-btn" onclick="toggleDark()">🌙 Toggle Dark Mode</button>
+  </header>
+
+  <main>
+    <div class="upload-section">
+      <h2>Upload an Image</h2>
+      <input id="file" type="file" accept="image/*" />
+      <br>
+      <button id="send">🔍 Analyze</button>
+    </div>
+
+    <div class="preview card">
+      <h3>Selected Image:</h3>
+      <img id="preview" />
+    </div>
+
+    <div class="results">
+      <div class="card">
+        <h3>Prediction Result</h3>
+        <p id="prediction">No result yet.</p>
+      </div>
+      <div class="card gradcam">
+        <h3>Grad-CAM Heatmap</h3>
+        <img id="cam" />
+      </div>
+      <div class="card">
+        <h3>Raw JSON Response</h3>
+        <pre id="out">{}</pre>
+      </div>
+    </div>
+
+    <div class="instructions card">
+      <h3>📌 How to use:</h3>
+      <ul>
+        <li>Click <strong>Choose File</strong> and select a medical image (e.g., chest X-ray, MRI).</li>
+        <li>Click <strong>Analyze</strong> to run the AI model.</li>
+        <li>View predicted class and confidence score above.</li>
+        <li>Check the <strong>Grad-CAM Heatmap</strong> to see which regions influenced the decision.</li>
+        <li>You can toggle 🌙 <strong>Dark Mode</strong> anytime for better visibility.</li>
+      </ul>
+    </div>
+  </main>
+
+  <script>
+    const fileEl = document.getElementById('file');
+    const preview = document.getElementById('preview');
+    const outEl = document.getElementById('out');
+    const predEl = document.getElementById('prediction');
+    const camImg = document.getElementById('cam');
+    const sendBtn = document.getElementById('send');
+
+    // Dark mode toggle
+    function toggleDark() {
+      document.body.classList.toggle('dark');
+    }
+
+    // Preview selected image
+    fileEl.addEventListener('change', () => {
+      const f = fileEl.files[0];
+      if (f) {
+        preview.src = URL.createObjectURL(f);
+      }
+    });
+
+    // Predict function
+    async function predict() {
+      const f = fileEl.files[0];
+      if (!f) { alert("Please choose an image first."); return; }
+      const fd = new FormData();
+      fd.append('file', f);
+
+      predEl.textContent = "Analyzing...";
+      outEl.textContent = "Uploading...";
+
+      try {
+        const res = await fetch('/predict', { method: 'POST', body: fd });
+        const data = await res.json();
+        outEl.textContent = JSON.stringify(data, null, 2);
+
+        if (data.success) {
+          predEl.innerHTML = `
+            <strong>Class:</strong> ${data.predicted_label} <br>
+            <strong>Confidence:</strong> ${(data.confidence * 100).toFixed(2)}%
+          `;
+          if (data.gradcam_overlay) {
+            camImg.src = "data:image/png;base64," + data.gradcam_overlay;
+          } else {
+            camImg.removeAttribute("src");
+          }
+        } else {
+          predEl.textContent = "Error: " + data.error;
+        }
+      } catch (err) {
+        outEl.textContent = "Request failed: " + err.message;
+        predEl.textContent = "Error during prediction.";
+      }
+    }
+
+    sendBtn.addEventListener('click', predict);
+  </script>
+</body>
+</html>

@@ -1,0 +1,599 @@
+# Medical Image Classifier - Model Development
+# Run this notebook in Google Colab
+
+# ============================================================================
+# SETUP AND IMPORTS
+# ============================================================================
+
+import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms, models
+import torchvision.transforms as T
+from PIL import Image
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
+import cv2
+from tqdm import tqdm
+import zipfile
+import shutil
+from pathlib import Path
+
+# Install required packages (run in Colab)
+# !pip install torchcam kaggle pillow opencv-python
+
+# For Grad-CAM implementation
+import torch.nn.functional as F
+from torchcam.methods import GradCAM
+from torchcam.utils import overlay_mask
+
+# Set device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+# ============================================================================
+# DATA PREPARATION
+# ============================================================================
+
+class ChestXrayDataset(Dataset):
+    """Custom dataset class for chest X-ray images"""
+    
+    def __init__(self, data_dir, transform=None, train=True):
+        self.data_dir = Path(data_dir)
+        self.transform = transform
+        self.train = train
+        
+        # Load image paths and labels
+        self.image_paths = []
+        self.labels = []
+        
+        # Assuming folder structure: data_dir/NORMAL/, data_dir/PNEUMONIA/
+        normal_dir = self.data_dir / 'NORMAL'
+        pneumonia_dir = self.data_dir / 'PNEUMONIA'
+        
+        # Load normal images (label: 0)
+        if normal_dir.exists():
+            for img_path in normal_dir.glob('*.jpeg'):
+                self.image_paths.append(img_path)
+                self.labels.append(0)
+        
+        # Load pneumonia images (label: 1)
+        if pneumonia_dir.exists():
+            for img_path in pneumonia_dir.glob('*.jpeg'):
+                self.image_paths.append(img_path)
+                self.labels.append(1)
+        
+        print(f"Loaded {len(self.image_paths)} images")
+        print(f"Normal: {self.labels.count(0)}, Pneumonia: {self.labels.count(1)}")
+    
+    def __len__(self):
+        return len(self.image_paths)
+    
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        label = self.labels[idx]
+        
+        # Load and convert image
+        image = Image.open(img_path).convert('RGB')
+        
+        if self.transform:
+            image = self.transform(image)
+        
+        return image, label
+
+def setup_data_transforms():
+    """Define data transformations for training and validation"""
+    
+    # ImageNet normalization stats
+    normalize = transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
+    )
+    
+    # Training transforms with augmentation
+    train_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.RandomRotation(10),
+        transforms.RandomHorizontalFlip(0.3),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2),
+        transforms.ToTensor(),
+        normalize
+    ])
+    
+    # Validation transforms (no augmentation)
+    val_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        normalize
+    ])
+    
+    return train_transform, val_transform
+
+def download_and_setup_dataset():
+    """Download and setup the chest X-ray dataset from Kaggle"""
+    
+    # Note: You need to upload your kaggle.json to Colab first
+    # !mkdir -p ~/.kaggle
+    # !cp kaggle.json ~/.kaggle/
+    # !chmod 600 ~/.kaggle/kaggle.json
+    
+    # Download dataset
+    # !kaggle datasets download -d paultimothymooney/chest-xray-pneumonia
+    
+    # Extract dataset
+    # with zipfile.ZipFile('chest-xray-pneumonia.zip', 'r') as zip_ref:
+    #     zip_ref.extractall('.')
+    
+    print("Dataset setup complete!")
+    print("Expected structure:")
+    print("chest_xray/train/NORMAL/")
+    print("chest_xray/train/PNEUMONIA/")
+    print("chest_xray/val/NORMAL/")
+    print("chest_xray/val/PNEUMONIA/")
+    print("chest_xray/test/NORMAL/")
+    print("chest_xray/test/PNEUMONIA/")
+
+# ============================================================================
+# MODEL DEFINITION
+# ============================================================================
+
+class MedicalImageClassifier(nn.Module):
+    """ResNet18-based medical image classifier"""
+    
+    def __init__(self, num_classes=2, pretrained=True):
+        super(MedicalImageClassifier, self).__init__()
+        
+        # Load pretrained ResNet18
+        self.backbone = models.resnet18(pretrained=pretrained)
+        
+        # Get number of features in final layer
+        num_features = self.backbone.fc.in_features
+        
+        # Replace final layer for our classification task
+        self.backbone.fc = nn.Sequential(
+            nn.Dropout(0.3),
+            nn.Linear(num_features, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, num_classes)
+        )
+        
+        # Store feature extractor for Grad-CAM
+        self.features = nn.Sequential(*list(self.backbone.children())[:-2])
+        self.avgpool = self.backbone.avgpool
+        self.classifier = self.backbone.fc
+    
+    def forward(self, x):
+        # Extract features
+        features = self.features(x)
+        
+        # Global average pooling
+        pooled = self.avgpool(features)
+        pooled = torch.flatten(pooled, 1)
+        
+        # Classification
+        output = self.classifier(pooled)
+        
+        return output
+    
+    def get_features(self, x):
+        """Extract features for Grad-CAM"""
+        return self.features(x)
+
+# ============================================================================
+# TRAINING UTILITIES
+# ============================================================================
+
+def train_model(model, train_loader, val_loader, num_epochs=20, lr=0.001):
+    """Train the medical image classifier"""
+    
+    # Loss function and optimizer
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.1)
+    
+    # Training history
+    train_losses = []
+    val_losses = []
+    train_accs = []
+    val_accs = []
+    
+    best_val_acc = 0.0
+    best_model_state = None
+    
+    for epoch in range(num_epochs):
+        print(f'Epoch {epoch+1}/{num_epochs}')
+        print('-' * 50)
+        
+        # Training phase
+        model.train()
+        train_loss = 0.0
+        train_correct = 0
+        train_total = 0
+        
+        for images, labels in tqdm(train_loader, desc='Training'):
+            images, labels = images.to(device), labels.to(device)
+            
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item()
+            _, predicted = torch.max(outputs.data, 1)
+            train_total += labels.size(0)
+            train_correct += (predicted == labels).sum().item()
+        
+        train_acc = 100 * train_correct / train_total
+        avg_train_loss = train_loss / len(train_loader)
+        
+        # Validation phase
+        model.eval()
+        val_loss = 0.0
+        val_correct = 0
+        val_total = 0
+        val_preds = []
+        val_labels = []
+        
+        with torch.no_grad():
+            for images, labels in tqdm(val_loader, desc='Validation'):
+                images, labels = images.to(device), labels.to(device)
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+                
+                val_loss += loss.item()
+                _, predicted = torch.max(outputs.data, 1)
+                val_total += labels.size(0)
+                val_correct += (predicted == labels).sum().item()
+                
+                # Store for metrics
+                val_preds.extend(predicted.cpu().numpy())
+                val_labels.extend(labels.cpu().numpy())
+        
+        val_acc = 100 * val_correct / val_total
+        avg_val_loss = val_loss / len(val_loader)
+        
+        # Update learning rate
+        scheduler.step()
+        
+        # Store metrics
+        train_losses.append(avg_train_loss)
+        val_losses.append(avg_val_loss)
+        train_accs.append(train_acc)
+        val_accs.append(val_acc)
+        
+        print(f'Train Loss: {avg_train_loss:.4f}, Train Acc: {train_acc:.2f}%')
+        print(f'Val Loss: {avg_val_loss:.4f}, Val Acc: {val_acc:.2f}%')
+        
+        # Save best model
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_model_state = model.state_dict().copy()
+            print(f'New best validation accuracy: {best_val_acc:.2f}%')
+        
+        print()
+    
+    # Load best model state
+    model.load_state_dict(best_model_state)
+    
+    return model, {
+        'train_losses': train_losses,
+        'val_losses': val_losses,
+        'train_accs': train_accs,
+        'val_accs': val_accs,
+        'best_val_acc': best_val_acc
+    }
+
+def evaluate_model(model, test_loader, class_names=['Normal', 'Pneumonia']):
+    """Evaluate model performance on test set"""
+    
+    model.eval()
+    all_preds = []
+    all_labels = []
+    all_probs = []
+    
+    with torch.no_grad():
+        for images, labels in tqdm(test_loader, desc='Testing'):
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            probs = torch.softmax(outputs, dim=1)
+            _, predicted = torch.max(outputs, 1)
+            
+            all_preds.extend(predicted.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
+    
+    # Calculate metrics
+    accuracy = sum(p == l for p, l in zip(all_preds, all_labels)) / len(all_labels)
+    
+    # Classification report
+    print("Classification Report:")
+    print(classification_report(all_labels, all_preds, target_names=class_names))
+    
+    # Confusion Matrix
+    cm = confusion_matrix(all_labels, all_preds)
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                xticklabels=class_names, yticklabels=class_names)
+    plt.title('Confusion Matrix')
+    plt.ylabel('True Label')
+    plt.xlabel('Predicted Label')
+    plt.show()
+    
+    # ROC AUC
+    if len(class_names) == 2:  # Binary classification
+        auc_score = roc_auc_score(all_labels, np.array(all_probs)[:, 1])
+        print(f"ROC AUC Score: {auc_score:.4f}")
+    
+    return accuracy, all_preds, all_labels, all_probs
+
+# ============================================================================
+# GRAD-CAM IMPLEMENTATION
+# ============================================================================
+
+class GradCAMVisualizer:
+    """Custom Grad-CAM implementation for medical image explanation"""
+    
+    def __init__(self, model, target_layer):
+        self.model = model
+        self.target_layer = target_layer
+        self.gradients = None
+        self.activations = None
+        
+        # Register hooks
+        self.target_layer.register_forward_hook(self.save_activation)
+        self.target_layer.register_backward_hook(self.save_gradient)
+    
+    def save_activation(self, module, input, output):
+        self.activations = output.detach()
+    
+    def save_gradient(self, module, grad_input, grad_output):
+        self.gradients = grad_output[0].detach()
+    
+    def generate_cam(self, input_tensor, target_class):
+        """Generate Grad-CAM heatmap"""
+        
+        # Forward pass
+        self.model.eval()
+        output = self.model(input_tensor)
+        
+        # Backward pass
+        self.model.zero_grad()
+        target_score = output[0, target_class]
+        target_score.backward()
+        
+        # Generate CAM
+        gradients = self.gradients[0]  # [C, H, W]
+        activations = self.activations[0]  # [C, H, W]
+        
+        # Global average pooling of gradients
+        weights = torch.mean(gradients, dim=(1, 2))  # [C]
+        
+        # Weighted sum of activation maps
+        cam = torch.zeros(activations.shape[1:])  # [H, W]
+        for i, w in enumerate(weights):
+            cam += w * activations[i]
+        
+        # Apply ReLU
+        cam = F.relu(cam)
+        
+        # Normalize
+        cam = cam - cam.min()
+        cam = cam / cam.max()
+        
+        return cam.cpu().numpy()
+    
+    def visualize_cam(self, input_tensor, target_class, original_image, alpha=0.4):
+        """Create overlay visualization"""
+        
+        # Generate CAM
+        cam = self.generate_cam(input_tensor, target_class)
+        
+        # Resize CAM to original image size
+        cam_resized = cv2.resize(cam, (224, 224))
+        
+        # Create heatmap
+        heatmap = cv2.applyColorMap(np.uint8(255 * cam_resized), cv2.COLORMAP_JET)
+        heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
+        
+        # Convert original image to numpy
+        if isinstance(original_image, torch.Tensor):
+            # Denormalize
+            mean = np.array([0.485, 0.456, 0.406])
+            std = np.array([0.229, 0.224, 0.225])
+            original_np = original_image.cpu().numpy().transpose(1, 2, 0)
+            original_np = original_np * std + mean
+            original_np = np.clip(original_np, 0, 1)
+            original_np = (original_np * 255).astype(np.uint8)
+        else:
+            original_np = np.array(original_image)
+        
+        # Create overlay
+        overlay = heatmap * alpha + original_np * (1 - alpha)
+        overlay = overlay.astype(np.uint8)
+        
+        return cam_resized, heatmap, overlay
+
+# ============================================================================
+# MAIN TRAINING PIPELINE
+# ============================================================================
+
+def main_training_pipeline():
+    """Main training pipeline"""
+    
+    # 1. Setup data
+    print("Setting up data transformations...")
+    train_transform, val_transform = setup_data_transforms()
+    
+    # Note: Update paths based on your dataset location
+    data_root = "chest_xray"  # Update this path
+    
+    # Create datasets
+    print("Loading datasets...")
+    train_dataset = ChestXrayDataset(
+        f"{data_root}/train", 
+        transform=train_transform, 
+        train=True
+    )
+    val_dataset = ChestXrayDataset(
+        f"{data_root}/val", 
+        transform=val_transform, 
+        train=False
+    )
+    test_dataset = ChestXrayDataset(
+        f"{data_root}/test", 
+        transform=val_transform, 
+        train=False
+    )
+    
+    # Create data loaders
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=2)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=2)
+    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=2)
+    
+    print(f"Train samples: {len(train_dataset)}")
+    print(f"Validation samples: {len(val_dataset)}")
+    print(f"Test samples: {len(test_dataset)}")
+    
+    # 2. Create model
+    print("\nInitializing model...")
+    model = MedicalImageClassifier(num_classes=2, pretrained=True)
+    model = model.to(device)
+    
+    # 3. Train model
+    print("\nStarting training...")
+    trained_model, history = train_model(
+        model, train_loader, val_loader, 
+        num_epochs=20, lr=0.001
+    )
+    
+    # 4. Plot training history
+    plt.figure(figsize=(15, 5))
+    
+    plt.subplot(1, 2, 1)
+    plt.plot(history['train_losses'], label='Train Loss')
+    plt.plot(history['val_losses'], label='Validation Loss')
+    plt.title('Model Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    
+    plt.subplot(1, 2, 2)
+    plt.plot(history['train_accs'], label='Train Accuracy')
+    plt.plot(history['val_accs'], label='Validation Accuracy')
+    plt.title('Model Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy (%)')
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # 5. Evaluate model
+    print("\nEvaluating model...")
+    test_accuracy, _, _, _ = evaluate_model(trained_model, test_loader)
+    print(f"Final Test Accuracy: {test_accuracy:.4f}")
+    
+    # 6. Save model
+    print("\nSaving model...")
+    torch.save({
+        'model_state_dict': trained_model.state_dict(),
+        'model_architecture': 'resnet18',
+        'num_classes': 2,
+        'class_names': ['Normal', 'Pneumonia'],
+        'test_accuracy': test_accuracy,
+        'training_history': history
+    }, 'best_model.pth')
+    
+    print("Model saved as 'best_model.pth'")
+    
+    # 7. Demo Grad-CAM
+    print("\nGenerating Grad-CAM visualization...")
+    demo_gradcam(trained_model, test_loader)
+    
+    return trained_model, history
+
+def demo_gradcam(model, test_loader):
+    """Demonstrate Grad-CAM visualization"""
+    
+    # Get a sample image
+    model.eval()
+    data_iter = iter(test_loader)
+    images, labels = next(data_iter)
+    
+    # Take first image
+    sample_image = images[0:1].to(device)
+    sample_label = labels[0].item()
+    
+    # Get model prediction
+    with torch.no_grad():
+        output = model(sample_image)
+        probs = torch.softmax(output, dim=1)
+        pred_class = torch.argmax(output, dim=1).item()
+        confidence = probs[0, pred_class].item()
+    
+    print(f"True label: {['Normal', 'Pneumonia'][sample_label]}")
+    print(f"Predicted: {['Normal', 'Pneumonia'][pred_class]} (confidence: {confidence:.3f})")
+    
+    # Generate Grad-CAM
+    # Get the last convolutional layer
+    target_layer = model.features[-1]  # Last conv layer in ResNet18
+    
+    gradcam = GradCAMVisualizer(model, target_layer)
+    cam, heatmap, overlay = gradcam.visualize_cam(
+        sample_image, pred_class, images[0]
+    )
+    
+    # Plot results
+    plt.figure(figsize=(15, 5))
+    
+    plt.subplot(1, 3, 1)
+    # Denormalize original image for display
+    orig_img = images[0].cpu().numpy().transpose(1, 2, 0)
+    mean = np.array([0.485, 0.456, 0.406])
+    std = np.array([0.229, 0.224, 0.225])
+    orig_img = orig_img * std + mean
+    orig_img = np.clip(orig_img, 0, 1)
+    plt.imshow(orig_img)
+    plt.title('Original Image')
+    plt.axis('off')
+    
+    plt.subplot(1, 3, 2)
+    plt.imshow(cam, cmap='jet')
+    plt.title('Grad-CAM Heatmap')
+    plt.axis('off')
+    
+    plt.subplot(1, 3, 3)
+    plt.imshow(overlay)
+    plt.title('Overlay')
+    plt.axis('off')
+    
+    plt.tight_layout()
+    plt.show()
+
+# ============================================================================
+# RUN TRAINING
+# ============================================================================
+
+if __name__ == "__main__":
+    # Uncomment to download dataset
+    # download_and_setup_dataset()
+    
+    # Run training pipeline
+    model, history = main_training_pipeline()
+    
+    print("\n" + "="*60)
+    print("TRAINING COMPLETE!")
+    print("="*60)
+    print("Files created:")
+    print("- best_model.pth (saved model)")
+    print("\nNext steps:")
+    print("1. Download 'best_model.pth' from Colab")
+    print("2. Use it in the Flask app for deployment")
+    print("="*60)
